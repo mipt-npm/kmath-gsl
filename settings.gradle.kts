@@ -9,6 +9,7 @@ pluginManagement {
         id("ru.mipt.npm.gradle.project") version "0.10.1"
         id("de.undercouch.download") version "4.1.2"
         kotlin("multiplatform") version "1.5.21"
+        id("io.github.krakowski.jextract") version "0.2.1"
     }
 }
 
