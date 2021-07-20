@@ -1,8 +1,8 @@
-@file:Suppress("UNUSED_VARIABLE")
-
 import de.undercouch.gradle.tasks.download.Download
 import org.jetbrains.dokka.gradle.DokkaTask
+import org.jetbrains.kotlin.gradle.tasks.AbstractKotlinNativeCompile
 import ru.mipt.npm.gradle.Maturity
+import org.jetbrains.kotlin.konan.target.HostManager
 import space.kscience.kmath.gsl.codegen.matricesCodegen
 import space.kscience.kmath.gsl.codegen.vectorsCodegen
 import java.net.URL
@@ -20,6 +20,7 @@ version = "0.3.0-dev-3"
 repositories {
     mavenCentral()
     maven("https://repo.kotlin.link")
+    maven("https://maven.pkg.jetbrains.space/kotlin/p/kotlin/dev")
 }
 
 kotlin {
@@ -27,16 +28,17 @@ kotlin {
 
     data class DownloadLinks(val gsl: String?)
 
-    val osName = System.getProperty("os.name")
-    val isWindows = osName.startsWith("Windows")
+    val nativeTargets = setOf(linuxX64(), mingwX64(), macosX64())
 
-    val (nativeTarget, downloadLinks) = when {
-        osName == "Linux" -> linuxX64() to DownloadLinks(
+    val downloadLinks = when(HostManager.hostOs()) {
+        "linux" -> DownloadLinks(
             gsl = "https://anaconda.org/conda-forge/gsl/2.7/download/linux-64/gsl-2.7-he838d99_0.tar.bz2",
         )
 
-        isWindows -> mingwX64() to DownloadLinks(
-            gsl = null,
+        "windows" -> DownloadLinks(gsl = null)
+
+        "osx" -> DownloadLinks(
+            gsl = "https://anaconda.org/conda-forge/gsl/2.7/download/osx-64/gsl-2.7-h93259b0_0.tar.bz2"
         )
 
         else -> {
@@ -48,13 +50,62 @@ kotlin {
     val thirdPartyDir =
         File("${System.getProperty("user.home")}/.konan/third-party/kmath-gsl-${project.property("version")}")
 
-    val main by nativeTarget.compilations.getting
+    val downloadGsl by tasks.creating(Download::class) {
+        if (downloadLinks.gsl == null) {
+            enabled = false
+            return@creating
+        }
 
-    val test by nativeTarget.compilations.getting {
-        defaultSourceSet.dependsOn(main.defaultSourceSet)
+        src(downloadLinks.gsl)
+        dest(thirdPartyDir.resolve("libgsl.tar.bz2"))
+        overwrite(false)
     }
 
-    val libgsl by main.cinterops.creating
+    val extractGsl by tasks.creating(Exec::class) {
+        if (downloadLinks.gsl == null) {
+            enabled = false
+            return@creating
+        }
+
+        dependsOn(downloadGsl)
+        workingDir(thirdPartyDir)
+        commandLine("tar", "-xf", downloadGsl.dest)
+    }
+
+    val writeDefFile by tasks.creating {
+        val file = projectDir.resolve("src/nativeInterop/cinterop/libgsl.def")
+        file.parentFile.mkdirs()
+        if (!file.exists()) file.createNewFile()
+
+        file.writeText(
+            """
+                    package=org.gnu.gsl
+                    headers=gsl/gsl_blas.h gsl/gsl_linalg.h gsl/gsl_permute_matrix.h gsl/gsl_matrix.h gsl/gsl_vector.h gsl/gsl_errno.h
+
+                    linkerOpts.linux=-L/usr/lib64 -L/usr/lib/x86_64-linux-gnu -lblas
+                    staticLibraries.linux=libgsl.a libgslcblas.a
+                    compilerOpts.linux=-I${thirdPartyDir}/include/
+                    libraryPaths.linux=${thirdPartyDir}/lib/
+                    
+                    linkerOpts.osx=-L/opt/local/lib -L/usr/local/lib -lblas
+                    staticLibraries.osx=libgsl.a libgslcblas.a
+                    compilerOpts.osx=-I${thirdPartyDir}/include/
+                    libraryPaths.osx=${thirdPartyDir}/lib/
+
+                    linkerOpts.mingw=-LC:/msys64/mingw64/lib/ -LC:/msys64/mingw64/bin/
+                    staticLibraries.mingw=libgsl.a libgslcblas.a
+                    compilerOpts.mingw=-IC:/msys64/mingw64/include/
+                    libraryPaths.mingw=C:/msys64/mingw64/lib/
+                    ---
+                    inline int gsl_matrix_float_scale2(gsl_matrix_float *a, const float x) {
+                        return gsl_matrix_float_scale(a, x);
+                    }
+
+                """.trimIndent()
+        )
+
+        dependsOn(extractGsl)
+    }
 
     sourceSets {
         all {
@@ -72,8 +123,8 @@ kotlin {
 
         val nativeMain by creating {
             val codegen by tasks.creating {
-                matricesCodegen(kotlin.srcDirs.first().absolutePath + "/_Matrices.kt")
-                vectorsCodegen(kotlin.srcDirs.first().absolutePath + "/_Vectors.kt")
+                matricesCodegen(kotlin.srcDirs.first().resolve("_Matrices.kt"))
+                vectorsCodegen(kotlin.srcDirs.first().resolve("_Vectors.kt"))
             }
 
             kotlin.srcDirs(files().builtBy(codegen))
@@ -81,71 +132,36 @@ kotlin {
         }
 
         val nativeTest by creating {
-            dependsOn(nativeMain)
             dependsOn(commonTest.get())
         }
 
-        main.defaultSourceSet.dependsOn(nativeMain)
-        test.defaultSourceSet.dependsOn(nativeTest)
-    }
-
-    val downloadGsl by tasks.creating(Download::class) {
-        if (downloadLinks.gsl == null) {
-            enabled = false
-            return@creating
+        configure(nativeTargets) {
+            val main by compilations.getting
+            val test by compilations.getting
+            main.defaultSourceSet.dependsOn(nativeMain)
+            test.defaultSourceSet.dependsOn(nativeTest)
+            val libgsl by main.cinterops.creating
+            tasks[libgsl.interopProcessingTaskName].dependsOn(writeDefFile)
         }
-
-        src(downloadLinks.gsl)
-        dest(File(thirdPartyDir, "libgsl.tar.bz2"))
-        overwrite(false)
     }
-
-    val extractGsl by tasks.creating(Exec::class) {
-        if (downloadLinks.gsl == null) {
-            enabled = false
-            return@creating
-        }
-
-        dependsOn(downloadGsl)
-        workingDir(thirdPartyDir)
-        commandLine("tar", "-xf", downloadGsl.dest)
-    }
-
-    val writeDefFile by tasks.creating {
-        val file = libgsl.defFile
-        file.parentFile.mkdirs()
-        if (!file.exists()) file.createNewFile()
-
-        file.writeText(
-            """
-                    package=org.gnu.gsl
-                    headers=gsl/gsl_blas.h gsl/gsl_linalg.h gsl/gsl_permute_matrix.h gsl/gsl_matrix.h gsl/gsl_vector.h gsl/gsl_errno.h
-
-                    linkerOpts.linux=-L/usr/lib64 -L/usr/lib/x86_64-linux-gnu -lblas
-                    staticLibraries.linux=libgsl.a libgslcblas.a
-                    compilerOpts.linux=-I${thirdPartyDir}/include/
-                    libraryPaths.linux=${thirdPartyDir}/lib/
-
-                    linkerOpts.mingw=-LC:/msys64/mingw64/lib/ -LC:/msys64/mingw64/bin/
-                    staticLibraries.mingw=libgsl.a libgslcblas.a
-                    compilerOpts.mingw=-IC:/msys64/mingw64/include/
-                    libraryPaths.mingw=C:/msys64/mingw64/lib/
-                    ---
-                    inline int gsl_matrix_float_scale2(gsl_matrix_float *a, const float x) {
-                        return gsl_matrix_float_scale(a, x);
-                    }
-
-                """.trimIndent()
-        )
-
-        dependsOn(extractGsl)
-    }
-
-    tasks[libgsl.interopProcessingTaskName].dependsOn(writeDefFile)
 
     targets.all {
         compilations.all {
             kotlinOptions.freeCompilerArgs += "-Xopt-in=kotlin.RequiresOptIn"
+        }
+    }
+}
+
+tasks {
+    withType<org.jetbrains.kotlin.gradle.tasks.CInteropProcess> {
+        onlyIf {
+            konanTarget == HostManager.host
+        }
+    }
+
+    withType<AbstractKotlinNativeCompile<*, *>> {
+        onlyIf {
+            compilation.konanTarget == HostManager.host
         }
     }
 }
